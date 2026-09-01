@@ -16,13 +16,7 @@ This document walks through what was built, the reasoning behind the security co
 
 ## 1. Architecture Diagram
 
-
 ![VNet creation](screenshots/00-Diagram.png)
-
-
-![VNet creation](screenshots/04-vnet-learningsteps-creation.png)
-![Public subnet](screenshots/02-subnet-web-public.png)
-![Private subnet](screenshots/03-subnet-db-private.png)
 
 ---
 
@@ -40,6 +34,9 @@ This document walks through what was built, the reasoning behind the security co
 | DB VM | `vm-db` | Ubuntu 24.04 LTS, Private IP `192.168.0.4`, no public IP |
 
 ![Resource group created](screenshots/01-rg-created.png)
+![Public subnet](screenshots/02-subnet-web-public.png)
+![Private subnet](screenshots/03-subnet-db-private.png)
+![VNet creation](screenshots/04-vnet-learningsteps-creation.png)
 ![NSGs created](screenshots/05-NSGs-created.png)
 ![VM web create](screenshots/10-vm-web-create.png)
 ![VM db create](screenshots/11-vm-db-create.png)
