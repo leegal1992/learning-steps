@@ -1,6 +1,12 @@
 # LearningSteps Origins — Azure 2-Tier Deployment
 
-This document describes the deployment of the **LearningSteps API** (FastAPI + PostgreSQL) to a secure 2-tier architecture on Microsoft Azure, built as part of the LearningSteps Origins individual project.
+## Overview
+
+LearningSteps is a FastAPI application backed by a PostgreSQL database that lets users track their daily learning journey through CRUD journal entries. The goal of this project was to take that application off `localhost` and deploy it as a secure, production-style 2-tier architecture on Microsoft Azure — one internet-facing tier for the application, and one strictly private tier for the database.
+
+Rather than putting everything on a single server, the architecture separates concerns at the network level: the FastAPI server sits in a public subnet where it can accept traffic from the outside world, while PostgreSQL sits in a private subnet with no route in from the internet at all. The only way data reaches the database is through the application server itself, over a controlled internal path. This mirrors how real production systems are typically laid out — the public-facing layer is treated as expendable and replaceable, while the data layer is treated as the asset that needs the most protection.
+
+This document walks through what was built, the reasoning behind the security configuration, the problems encountered along the way, and what the process revealed about how Azure networking actually behaves versus how it looks on paper.
 
 - **Codebase used:** `reference` branch (Reference Implementation)
 - **Cloud provider:** Microsoft Azure
@@ -10,52 +16,9 @@ This document describes the deployment of the **LearningSteps API** (FastAPI + P
 
 ## 1. Architecture Diagram
 
-```
-                          Internet
-                             │
-                             │ HTTP (port 8000)
-                             ▼
-                 ┌───────────────────────┐
-                 │   nsg-web (NSG)       │
-                 │  Allow: 8000, 22*     │
-                 └──────────┬────────────┘
-                             │
-                 ┌───────────────────────┐
-                 │ subnet-web-public     │
-                 │ 192.168.1.0/24        │
-                 │                       │
-                 │  ┌─────────────────┐  │
-                 │  │   vm-web        │  │
-                 │  │  Public IP:     │  │
-                 │  │  20.170.34.70   │  │
-                 │  │  FastAPI :8000  │  │
-                 │  └────────┬────────┘  │
-                 └───────────┼───────────┘
-                             │ TCP 5432
-                             │ (private VNet traffic only)
-                 ┌───────────▼───────────┐
-                 │ subnet-db-private     │
-                 │ 192.168.0.0/24        │
-                 │                       │
-                 │  ┌─────────────────┐  │
-                 │  │   vm-db         │  │
-                 │  │  No Public IP   │  │
-                 │  │  PostgreSQL     │  │
-                 │  │  192.168.0.4    │  │
-                 │  └─────────────────┘  │
-                 └───────────┬───────────┘
-                             │
-                 ┌───────────────────────┐
-                 │   nsg-db (NSG)        │
-                 │  Allow: 5432, 22 from │
-                 │  192.168.1.0/24 only  │
-                 └───────────────────────┘
 
-        VNet: vnet-learningsteps (192.168.0.0/16)
-        Resource Group: rg-learningsteps
+![VNet creation](screenshots/00-Diagram.png)
 
-*SSH on nsg-web restricted to admin's home IP only.
-```
 
 ![VNet creation](screenshots/04-vnet-learningsteps-creation.png)
 ![Public subnet](screenshots/02-subnet-web-public.png)
@@ -292,28 +255,60 @@ Test-NetConnection -ComputerName 20.170.34.70 -Port 5432
 
 ## 8. Security Decisions
 
-- **Two isolated subnets** separate the internet-facing tier from the data tier, so the database is never directly routable from the internet regardless of NSG misconfiguration on the web side.
-- **`nsg-db` only allows inbound traffic from `192.168.1.0/24`** (the web subnet) on ports 5432 and 22, rather than relying solely on default VNet connectivity — this keeps the rule explicit and auditable, and would still protect the DB tier if a future VM were added to the web subnet without authorization.
-- **SSH to `vm-db` is only reachable by hopping through `vm-web`**, since `vm-db` has no public IP and its NSG only allows SSH from the web subnet.
-- **SSH to `vm-web` is restricted to the admin's home IP** rather than left open to `Any`, reducing brute-force exposure on the one VM that is internet-facing.
-- **No explicit "deny all" rules were added** — Azure's implicit deny-all at priority 65500 already blocks everything not explicitly allowed, keeping the rule set minimal (least privilege by default, not by an extra rule).
+### Why two subnets instead of one
+
+The single most important decision in this architecture was splitting the network into `subnet-web-public` (192.168.1.0/24) and `subnet-db-private` (192.168.0.0/24) instead of running both the API and the database on one VM or one subnet. A single flat network would mean that anything exposed to the internet is only one misconfigured rule away from also exposing the database. By physically separating the tiers, the database's security doesn't depend on the web server being configured correctly — it has its own network boundary, its own NSG, and its own set of rules that don't care what happens on the web side. This is defense in depth: even if `nsg-web` were accidentally opened to `Any` on every port tomorrow, `vm-db` would still be unreachable from the internet because it isn't on a subnet that has one.
+
+### Why `vm-db` has no public IP at all
+
+The most effective control in this whole setup isn't actually a firewall rule — it's the absence of a public IP address on `vm-db`. An NSG rule can be misconfigured, disabled, or overridden by a higher-priority rule. A VM with no public IP simply has no interface for the internet to reach, full stop, regardless of what any NSG says. This was chosen as the primary line of defense, with NSG rules acting as a second, independent layer on top of it.
+
+### Why `nsg-db` explicitly allows only the web subnet, not "VNet default"
+
+Azure VMs on the same VNet can already reach each other by default, which technically makes the explicit `Allow-Postgres-FromWeb` rule (port 5432, source `192.168.1.0/24`) redundant on day one. It was added anyway, deliberately, for two reasons:
+
+1. **Auditability** — anyone reviewing the NSG later can see at a glance exactly which subnet is allowed to talk to the database on which port, without needing to know or trust the VNet's default behavior.
+2. **Future-proofing** — if another subnet or VM were added to this VNet later (e.g. a monitoring server, a bastion host, a second application tier), that new resource would **not** automatically get access to Postgres, because the rule is scoped to the web subnet specifically, not "anything inside the VNet." Least privilege should hold even as the network grows, not just on day one.
+
+### Why SSH access is scoped the way it is
+
+SSH into `vm-db` is only possible by first connecting to `vm-web` and hopping across the private network — `vm-db`'s NSG only allows port 22 from `192.168.1.0/24`. This means the database server has no direct SSH exposure to the outside world under any circumstance; an administrator has to already be inside the trusted network boundary (via the web server) to reach it. `vm-web`, being the one server that has to be internet-facing, has its SSH rule scoped even further — restricted to a single home IP address (`/32`) rather than `Any` — since it's the one point in the whole architecture where an open port faces the public internet, and it's the highest-value target for brute-force or credential-stuffing attempts.
+
+### Why no explicit "deny all" rule was added
+
+Azure NSGs already include an implicit deny-all rule at priority 65500 that blocks any traffic not explicitly allowed. Adding a redundant manual deny rule wouldn't change the actual security posture, but it would clutter the rule set. Keeping the NSGs to a short, explicit allow-list (and trusting the platform's default deny) makes it easier to read the security posture of each NSG at a glance — every rule listed is a deliberate exception, not noise.
 
 ---
 
 ## 9. Challenges
 
-- **`vm-db` had no outbound internet access**, since it lives in a private subnet with no public IP — this blocked `apt install postgresql` initially. Resolved by temporarily attaching a public IP to `vm-db` purely for outbound package downloads, then removing it immediately afterward. This didn't compromise the security requirement, since the NSG still blocked all *inbound* traffic from the internet during that window.
-- **The application listens on port 8000, not port 80** as initially assumed from the brief — the initial NSG only allowed port 80, causing `ERR_CONNECTION_REFUSED` in the browser. Resolved by adding an explicit inbound allow rule for port 8000 on `nsg-web`.
-- **Azure's newer "Trusted launch" security type** rejected the originally planned Ubuntu 22.04 LTS image; switched to Ubuntu 24.04 LTS Gen2, which is fully compatible and required no changes to any of the setup commands.
+### The private VM couldn't reach the internet to install its own software
+
+The first real obstacle came almost immediately after SSHing into `vm-db`: running `sudo apt install postgresql` failed with repeated connection timeouts to Ubuntu's package mirrors. At first this looked like a broken package repository, but it was actually the private subnet doing exactly what it was designed to do — `vm-db` has no public IP and no NAT gateway configured, so it has no outbound path to the internet at all, not just no inbound path. A completely airgapped-from-the-internet private subnet is more locked down than the project actually required at the install stage, since PostgreSQL itself still needs to be downloaded from somewhere.
+
+The fix was to temporarily attach a public IP address directly to `vm-db`'s network interface, purely to give it outbound internet access long enough to run `apt update && apt install postgresql`, and then immediately disassociate that public IP once the install finished. This is a meaningfully different thing from leaving the database permanently internet-facing: the NSG on `nsg-db` still only allowed **inbound** traffic on 5432/22 from the web subnet the entire time, so even with a public IP momentarily attached, nothing outside the VNet could actually connect in on the database port. The temporary IP only enabled outbound traffic initiated by the VM itself, which is a fundamentally different risk than an open inbound port. This was a good reminder that "private subnet" and "database security" aren't quite the same axis — a subnet can be fully isolated from inbound internet traffic while still needing a deliberate, temporary, and reversible outbound exception to be usable at all.
+
+### The application didn't come up where expected
+
+After deploying the FastAPI app and NSG rules for port 80 (as assumed from the initial planning), the browser returned `ERR_CONNECTION_REFUSED` when hitting `http://<public-ip>/docs`. Reading through `start.sh`'s actual console output showed the real cause: Uvicorn was binding to `0.0.0.0:8000`, not port 80 — the application's own startup script hardcodes port 8000, which hadn't been obvious from just reading the project brief. This wasn't a networking failure at all; it was a mismatch between an assumption (port 80) and what the code actually did (port 8000). The fix was straightforward once identified — add an explicit inbound allow rule for TCP 8000 on `nsg-web`, and access the app on the correct port. It was a useful reminder to verify the actual running behavior of an application rather than inferring its configuration from documentation or convention.
+
+### An incompatible VM image on first attempt
+
+When creating the VMs, the originally planned image (Ubuntu Server 22.04 LTS) was rejected by Azure with a message that it wasn't compatible with the "Trusted launch" security type selected by default for new VMs. Switching to Ubuntu Server 24.04 LTS (Gen2) resolved this immediately, and every subsequent command (`apt`, `systemctl`, PostgreSQL installation, Python setup) behaved identically to what was expected on 22.04 — the newer LTS release didn't require any changes to the planned setup steps, just a different starting image.
 
 ---
 
 ## 10. Key Learnings
 
-- Subnetting alone doesn't secure anything — it's the **combination of subnet placement + NSG rules + no public IP** that actually enforces the private tier.
-- NSGs attached at the **subnet level** apply to every resource in that subnet automatically, which is simpler to reason about and audit than attaching NSGs per-NIC.
-- Azure's implicit deny-all rule means a minimal, explicit allow-list is sufficient for least privilege — no need to manually add deny rules.
-- Provisioning a private VM sometimes still needs **temporary, deliberate, and reversible** exceptions (like brief outbound internet access) to complete setup — the key is ensuring inbound exposure is never opened, and that any temporary exception is closed again immediately after use.
+**Security in Azure networking is layered, not singular.** Going into this project, it was easy to think of "putting a VM in a private subnet" as the security control. In practice, the real protection came from three independent layers stacked together: no public IP (nothing to connect to from outside at all), subnet placement (isolated address space with its own NSG), and explicit NSG rules (only the web subnet, only on the ports actually needed). Any one of these failing on its own wouldn't have exposed the database, because the other two were still in place. That redundancy is the point — it's not about finding the one perfect rule, it's about making sure no single misconfiguration is catastrophic.
+
+**NSGs behave differently depending on where you attach them, and that matters for auditing.** Attaching an NSG to a subnet (rather than to each VM's individual network interface) means every resource placed in that subnet automatically inherits the same rules, without needing to remember to configure each new VM individually. This makes the security posture of a whole tier reviewable in one place instead of scattered across every NIC.
+
+**The platform's defaults are often already doing useful work.** Azure's implicit deny-all rule, and the default connectivity between VMs on the same VNet, both quietly did a lot of the heavy lifting in this architecture. Understanding what's already true by default (and why) made it possible to write a much shorter, more intentional set of explicit rules instead of over-specifying everything defensively.
+
+**Isolating a resource from inbound traffic and isolating it from outbound traffic are two separate problems.** The `apt install` failure on `vm-db` was a good practical lesson here — a private subnet with no NAT gateway and no public IP is isolated in both directions by default, but a real deployment sometimes needs a narrow, temporary exception for outbound package installation without ever compromising the inbound security guarantee. Recognizing that these are two different axes of "private" made it much easier to reason about what was actually safe to change temporarily.
+
+**Reading actual runtime output beats assuming configuration.** The port 8000 vs. port 80 issue wasn't a networking bug at all — it was an assumption that didn't match what the application was actually doing. The fastest way to debug it was to go back and read the literal console output from `start.sh` rather than trying to reason from the project brief alone. This is a habit that will matter well beyond this one project: verify what's actually running, don't just trust what should be running.
 
 ---
 
