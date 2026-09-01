@@ -1,4 +1,4 @@
-# LearningSteps Origins — Azure 2-Tier Deployment
+# LearningSteps Origins
 
 ## Overview
 
