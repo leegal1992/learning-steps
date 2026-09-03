@@ -1,3 +1,5 @@
+Note: This is the lab report. For project instructions, see Instructions instead.
+
 # LearningSteps Origins
 
 ## Overview
